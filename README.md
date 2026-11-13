@@ -2,6 +2,8 @@
 
 Converts community custom songs from **BeatSaver** (`.zip` packages, map folders, or direct BeatSaver search/IDs) directly into native **PS5 / PSVR2 Beat Saber** (`PPSA15035` / `PPSA14734`) game assets for a jailbroken PS5.
 
+Beat Saber version 1.12
+
 ---
 
 ## Features
