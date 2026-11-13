@@ -1,0 +1,30 @@
+# Virtual environments & Python caches
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+dist/
+build/
+
+# Local BeatSaver downloads, game dumps, backups, and exports
+_beatsaver_cache/
+_ps5_custom_converter_backups/
+PPSA*-app/
+*.resource
+*.resS
+*.assets
+*.orig
+*.tmp*
+*.zip
+*.mp4
+*.html
+
+# IDE / OS metadata
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
