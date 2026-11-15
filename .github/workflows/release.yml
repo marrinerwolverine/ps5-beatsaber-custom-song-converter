@@ -1,0 +1,72 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "pyproject.toml"
+      - "ps5_bs_converter/__init__.py"
+      - ".github/workflows/release.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Extract package version
+        id: ver
+        run: |
+          VERSION=$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml","rb"))["project"]["version"])')
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Check if release already exists
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "${{ steps.ver.outputs.tag }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Package release archive & publish GitHub Release
+        if: steps.check.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ steps.ver.outputs.tag }}"
+          ZIP_NAME="PS5-Beat-Saber-Custom-Song-Converter-${TAG}.zip"
+          git archive --format=zip --prefix="PS5 Beat Saber Custom Song Converter/" -o "$ZIP_NAME" HEAD
+          cat << 'EOF' > release_notes.md
+          ## What's New in v1.2.0
+
+          ### Dual PS5 Beat Saber Engine (`1.12` + `1.37`)
+          - **Beat Saber `1.37` (`01.037.000`, Unity `2022.3.33f1` Addressables):**
+            - Hardware-verified per-song `BeatmapLevelsData` `UnityFS` (`0x243` LZ4HC `q=12`) bundle builder & byte-exact level-pack `CAB` splicer (`208` Standard-only OST + DLC slots across `35` packs).
+            - `44,100 Hz` stereo Vorbis `FSB5` encoder with FMOD setup-header CRC `0x6D39BF3E`, 0-sample sync verification, and 10-second fade-in/out preview clips.
+            - Variable-BPM flattening + `v4.0.0` `beatmap`, `lightshow`, and `audio.gz` `TextAsset` conversion.
+            - Same-length `aa/catalog.json` `m_Crc: 0` patching and backport `ampr_emu.index` (`AMPRIDX3`) recorded file-size updates.
+            - Optional PS5 `Standard 4KB` tiled BC7 `SongArtworks` cover-art atlas paster.
+            - Whole-file FTP deployment with SHA-1 read-back verification (`ampr_emu.index` uploaded strictly last).
+          - **Beat Saber `1.12` (`01.012.000`, Unity `2021.3.16f1`):**
+            - Preserves full `Media/sharedassets*.assets` + `PCM16 FSB5` support across all `234` OST + DLC slots, `ColorSchemeSO` neon themes, and Wavefront `.obj` 3D stage geometry injection.
+
+          ### Studio Features & UI Redesign
+          - **Offline Audio-to-Beatmap Studio (`Ctrl+V` Any Music File):** Multi-band spectral flux BPM/phase analysis and procedural 5-difficulty (`Easy` -> `Expert+`) + synced lightshow generation from `.mp3`/`.wav`/`.ogg`/`.flac`.
+          - **Batch Pack Installer:** Fill any OST or DLC pack in 1 click from a BeatSaver `.bplist` playlist or folder of `.zip`/audio files.
+          - **Redesigned Dual-Saber Neon Studio UI:** Modern dark studio layout with sidebar workspace navigation, engine/slot KPI status pills, 1-click nearby dump switcher, live cover-art thumbnail preview, and live neon color swatches.
+          EOF
+          sed -i 's/^          //' release_notes.md
+          gh release create "$TAG" "$ZIP_NAME" \
+            --target "${{ github.sha }}" \
+            --title "PS5 Beat Saber Studio ${TAG} (1.12 + 1.37 Support)" \
+            --notes-file release_notes.md
