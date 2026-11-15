@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ps5-beatsaber-custom-song-converter"
-version = "1.0.0"
+version = "1.2.0"
 description = "Convert BeatSaver community custom songs into native PS5 / PSVR2 Beat Saber format."
 readme = "README.md"
 license = { text = "MIT" }
@@ -12,6 +12,11 @@ requires-python = ">=3.10"
 dependencies = [
     "soundfile>=0.12.0",
     "numpy>=1.24.0",
+    "lz4>=4.0.0",
+    "UnityPy>=1.25.0",
+    "Pillow>=10.0.0",
+    "etcpak>=0.9.0",
+    "texture2ddecoder>=1.0.5",
 ]
 
 [project.optional-dependencies]

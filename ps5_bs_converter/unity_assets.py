@@ -72,26 +72,37 @@ class AssetObject:
 
 
 class SerializedAssetsFile:
-    """Represents a Unity SerializedFile format v22 (.assets) file on PS5."""
+    """Represents a Unity SerializedFile format v22 (.assets or CAB-*) on PS4/PS5."""
 
-    def __init__(self, path: str):
-        self.path = path
-        self.filename = os.path.basename(path)
+    def __init__(self, path: Optional[str] = None, raw_bytes: Optional[bytes] = None, name: str = "CAB"):
+        self.path = path or ""
+        self.filename = os.path.basename(path) if path else name
         self.dirty = False
-        self._load(path)
+        if raw_bytes is not None:
+            self._load_bytes(raw_bytes, self.filename)
+        elif path is not None:
+            with open(path, "rb") as f:
+                self._load_bytes(f.read(), path)
+        else:
+            raise ValueError("Either path or raw_bytes must be provided")
+
+    @classmethod
+    def from_bytes(cls, raw_bytes: bytes, name: str = "CAB") -> "SerializedAssetsFile":
+        return cls(path=None, raw_bytes=raw_bytes, name=name)
 
     def _load(self, path: str) -> None:
         with open(path, "rb") as f:
-            orig = f.read()
+            self._load_bytes(f.read(), path)
 
+    def _load_bytes(self, orig: bytes, label: str) -> None:
         if len(orig) < 64:
-            raise ValueError(f"File too small to be a Unity SerializedFile: {path}")
+            raise ValueError(f"File too small to be a Unity SerializedFile: {label}")
 
         version = struct.unpack_from(">I", orig, 8)[0]
         endian = orig[16]
         if version != 22 or endian != 0:
             raise ValueError(
-                f"Unsupported SerializedFile version={version} endian={endian} in {path} (expected v22 LE)"
+                f"Unsupported SerializedFile version={version} endian={endian} in {label} (expected v22 LE)"
             )
 
         self.header20 = orig[:20]
@@ -512,6 +523,24 @@ class BeatmapDataObject:
 
 
 @dataclass
+class TextAssetData:
+    """Represents a Unity TextAsset (class_id=49) used inside v1.35/v1.37+ song bundles."""
+    name: str
+    script_bytes: bytes
+
+    @classmethod
+    def from_bytes(cls, blob: bytes) -> "TextAssetData":
+        name, off = read_aligned_str(blob, 0)
+        script_bytes, off2 = read_aligned_bytes(blob, off)
+        if off2 != len(blob):
+            raise ValueError(f"Trailing bytes in TextAsset '{name}': {off2} != {len(blob)}")
+        return cls(name=name, script_bytes=script_bytes)
+
+    def to_bytes(self) -> bytes:
+        return write_aligned_str(self.name) + write_aligned_bytes(self.script_bytes)
+
+
+@dataclass
 class AudioClipData:
     name: str
     load_type: int
@@ -603,3 +632,106 @@ class PerceivedLoudnessTable:
             out += struct.pack("<f", loudness)
             out += write_aligned_str(chk)
         return bytes(out)
+
+
+@dataclass
+class EnvironmentInfoEntry:
+    path_id: int
+    object_name: str
+    display_name: str
+    serialized_name: str
+    color_scheme_path_id: int
+    is_all_directions: bool = False
+
+
+@dataclass
+class ColorSchemeData:
+    """Represents ColorSchemeSO in resources.assets (148-byte RGBA float32 color payload)."""
+    head28: bytes
+    m_name: str
+    color_scheme_id: str
+    localized_name_key: str
+    use_non_localized_name: int
+    non_localized_name: str
+    is_editable: int
+    saber_a: Tuple[float, float, float, float]
+    saber_b: Tuple[float, float, float, float]
+    env_color_0: Tuple[float, float, float, float]
+    env_color_1: Tuple[float, float, float, float]
+    obstacles_color: Tuple[float, float, float, float]
+    env_color_w: Tuple[float, float, float, float]
+    supports_boost: int
+    env_color_0_boost: Tuple[float, float, float, float]
+    env_color_1_boost: Tuple[float, float, float, float]
+    env_color_w_boost: Tuple[float, float, float, float]
+
+    @classmethod
+    def from_bytes(cls, blob: bytes) -> "ColorSchemeData":
+        head28 = blob[:28]
+        m_name, off = read_aligned_str(blob, 28)
+        cs_id, off = read_aligned_str(blob, off)
+        loc_key, off = read_aligned_str(blob, off)
+        use_non_loc = struct.unpack_from("<I", blob, off)[0]
+        off += 4
+        non_loc_name, off = read_aligned_str(blob, off)
+        is_edit = struct.unpack_from("<I", blob, off)[0]
+        off += 4
+        if len(blob) - off != 148:
+            raise ValueError(f"Unexpected ColorSchemeSO payload length in {m_name}: {len(blob) - off}")
+
+        def r_rgba(o: int) -> Tuple[Tuple[float, float, float, float], int]:
+            return struct.unpack_from("<4f", blob, o), o + 16
+
+        saber_a, off = r_rgba(off)
+        saber_b, off = r_rgba(off)
+        env0, off = r_rgba(off)
+        env1, off = r_rgba(off)
+        obs, off = r_rgba(off)
+        env_w, off = r_rgba(off)
+        sup_boost = struct.unpack_from("<I", blob, off)[0]
+        off += 4
+        env0_b, off = r_rgba(off)
+        env1_b, off = r_rgba(off)
+        env_w_b, off = r_rgba(off)
+        return cls(
+            head28=head28,
+            m_name=m_name,
+            color_scheme_id=cs_id,
+            localized_name_key=loc_key,
+            use_non_localized_name=use_non_loc,
+            non_localized_name=non_loc_name,
+            is_editable=is_edit,
+            saber_a=saber_a,
+            saber_b=saber_b,
+            env_color_0=env0,
+            env_color_1=env1,
+            obstacles_color=obs,
+            env_color_w=env_w,
+            supports_boost=sup_boost,
+            env_color_0_boost=env0_b,
+            env_color_1_boost=env1_b,
+            env_color_w_boost=env_w_b,
+        )
+
+    def to_bytes(self) -> bytes:
+        out = bytearray(self.head28)
+        out += write_aligned_str(self.m_name)
+        out += write_aligned_str(self.color_scheme_id)
+        out += write_aligned_str(self.localized_name_key)
+        out += struct.pack("<I", self.use_non_localized_name)
+        out += write_aligned_str(self.non_localized_name)
+        out += struct.pack("<I", self.is_editable)
+        for rgba in (
+            self.saber_a,
+            self.saber_b,
+            self.env_color_0,
+            self.env_color_1,
+            self.obstacles_color,
+            self.env_color_w,
+        ):
+            out += struct.pack("<4f", *rgba)
+        out += struct.pack("<I", self.supports_boost)
+        for rgba in (self.env_color_0_boost, self.env_color_1_boost, self.env_color_w_boost):
+            out += struct.pack("<4f", *rgba)
+        return bytes(out)
+

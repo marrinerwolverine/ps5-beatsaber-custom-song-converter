@@ -102,11 +102,16 @@ def search_beatsaver(query: str, page: int = 0, sort_order: str = "Relevance") -
 
 
 def fetch_beatsaver_map_info(id_or_url: str) -> BeatSaverSearchResult:
-    map_id = extract_beatsaver_id(id_or_url)
-    doc = _http_get_json(f"{API_BASE}/maps/id/{map_id}")
+    s = id_or_url.strip()
+    # Support 40-char SHA-1 map hashes used in BeatSaver .bplist playlist files
+    if re.fullmatch(r"[0-9a-fA-F]{40}", s):
+        doc = _http_get_json(f"{API_BASE}/maps/hash/{s.lower()}")
+    else:
+        map_id = extract_beatsaver_id(s)
+        doc = _http_get_json(f"{API_BASE}/maps/id/{map_id}")
     parsed = _parse_doc(doc)
     if not parsed:
-        raise ValueError(f"BeatSaver map '{map_id}' has no downloadable version.")
+        raise ValueError(f"BeatSaver map '{id_or_url}' has no downloadable version.")
     return parsed
 
 

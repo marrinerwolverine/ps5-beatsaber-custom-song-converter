@@ -1,2 +1,7 @@
 soundfile>=0.12.0
 numpy>=1.24.0
+lz4>=4.0.0
+UnityPy>=1.25.0
+Pillow>=10.0.0
+etcpak>=0.9.0
+texture2ddecoder>=1.0.5

@@ -11,6 +11,12 @@ if not exist ".venv\Scripts\python.exe" (
         exit /b 1
     )
     ".venv\Scripts\python.exe" -m pip install -r requirements.txt
+) else (
+    ".venv\Scripts\python.exe" -c "import numpy, soundfile, lz4, UnityPy, PIL, texture2ddecoder" >nul 2>&1
+    if errorlevel 1 (
+        echo Installing updated dependencies for v1.2.0...
+        ".venv\Scripts\python.exe" -m pip install -r requirements.txt
+    )
 )
 
 start "" ".venv\Scripts\pythonw.exe" "%~dp0app.py"

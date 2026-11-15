@@ -71,6 +71,9 @@ class CustomSongPackage:
     # charts[characteristic][difficulty_int] = ParsedDifficultyChart
     charts: Dict[str, Dict[int, ParsedDifficultyChart]] = field(default_factory=dict)
     source_label: str = ""
+    environment_name: str = ""
+    custom_colors: Optional[Dict[str, Tuple[float, float, float]]] = None
+    cover_bytes: Optional[bytes] = None
 
     def native_summary(self) -> str:
         parts = []
@@ -260,6 +263,35 @@ def _load_v2_info_package(vfs: _VirtualMapArchive, info: Dict[str, Any]) -> Cust
     if not charts:
         raise ValueError(f"No playable difficulty beatmaps found in '{song_name}'")
 
+    env_name = str(info.get("_environmentName") or "").strip()
+    cover_fn = str(info.get("_coverImageFilename") or "").strip()
+    cover_bytes: Optional[bytes] = None
+    if cover_fn and vfs.has_file(cover_fn):
+        cover_bytes = vfs.read_bytes(cover_fn)
+    else:
+        for ext in (".jpg", ".jpeg", ".png"):
+            for k_low, k_orig in vfs._lower_map.items():
+                if k_low.endswith(ext):
+                    cover_bytes = vfs._files[k_orig]
+                    break
+            if cover_bytes:
+                break
+    custom_colors: Optional[Dict[str, Tuple[float, float, float]]] = None
+    # Extract SongCore / BeatSaver custom RGB colors if mapper included them in Info.dat
+    for bset in info.get("_difficultyBeatmapSets", []):
+        for diff_entry in bset.get("_difficultyBeatmaps", []):
+            cdata = diff_entry.get("_customData") or {}
+            found = {}
+            for key in ("_colorLeft", "_colorRight", "_envColorLeft", "_envColorRight", "_obstacleColor"):
+                val = cdata.get(key)
+                if isinstance(val, dict) and all(k in val for k in ("r", "g", "b")):
+                    found[key] = (float(val["r"]), float(val["g"]), float(val["b"]))
+            if found:
+                custom_colors = found
+                break
+        if custom_colors:
+            break
+
     return CustomSongPackage(
         song_name=song_name,
         song_sub_name=song_sub,
@@ -275,6 +307,9 @@ def _load_v2_info_package(vfs: _VirtualMapArchive, info: Dict[str, Any]) -> Cust
         audio_bytes=audio_bytes,
         charts=charts,
         source_label=vfs.label,
+        environment_name=env_name,
+        custom_colors=custom_colors,
+        cover_bytes=cover_bytes,
     )
 
 
@@ -366,6 +401,11 @@ def _load_v4_package(vfs: _VirtualMapArchive, info: Dict[str, Any]) -> CustomSon
     if not charts:
         raise ValueError(f"No playable V4 beatmaps found in '{song_name}'")
 
+    env_names = info.get("environmentNames") or []
+    env_name = str(env_names[0]).strip() if env_names else ""
+    cover_fn = str(song_meta.get("coverImageFilename") or info.get("coverImageFilename") or "").strip()
+    cover_bytes = vfs.read_bytes(cover_fn) if (cover_fn and vfs.has_file(cover_fn)) else None
+
     return CustomSongPackage(
         song_name=song_name,
         song_sub_name=song_sub,
@@ -381,6 +421,8 @@ def _load_v4_package(vfs: _VirtualMapArchive, info: Dict[str, Any]) -> CustomSon
         audio_bytes=audio_bytes,
         charts=charts,
         source_label=vfs.label,
+        environment_name=env_name,
+        cover_bytes=cover_bytes,
     )
 
 

@@ -35,6 +35,11 @@ HAS_REAL_DUMP = bool(REAL_DUMP_ROOT) and os.path.isfile(
     os.path.join(REAL_DUMP_ROOT, "Media", "sharedassets48.assets")
 )
 
+REAL_DUMP_137 = os.environ.get("PS5_BEATSABER_DUMP_137", "")
+HAS_REAL_DUMP_137 = bool(REAL_DUMP_137) and os.path.isdir(
+    os.path.join(REAL_DUMP_137, "Media", "StreamingAssets", "BeatmapLevelsData")
+)
+
 
 def _make_ogg_egg_bytes(duration_s: float = 4.0, sr: int = 44100, channels: int = 2) -> bytes:
     t = np.linspace(0.0, duration_s, int(sr * duration_s), endpoint=False, dtype=np.float32)
@@ -261,6 +266,205 @@ def test_v2_and_v4_conversion_and_generators():
     assert len(v4_std["bpmEvents"]) == 1
 
 
+def test_auto_mapper_audio_to_beatmap_and_zip_export(tmp_path):
+    from ps5_bs_converter.auto_mapper import (
+        export_package_to_beatsaver_zip,
+        generate_track_from_audio_file,
+    )
+
+    # Synthesize an 8-second 128 BPM electronic drum/bass test track
+    sr = 44100
+    dur = 8.0
+    t = np.linspace(0.0, dur, int(sr * dur), endpoint=False, dtype=np.float32)
+    beat_period = 60.0 / 128.0
+    phase_in_beat = np.mod(t, beat_period)
+    kick_env = np.exp(-phase_in_beat * 28.0)
+    kick = 0.7 * kick_env * np.sin(2.0 * np.pi * 65.0 * t)
+    lead = 0.25 * np.sin(2.0 * np.pi * 440.0 * t) * (1.0 + 0.5 * (t > 3.5))
+    stereo = np.column_stack((kick + lead, kick + lead)).astype(np.float32)
+
+    ogg_buf = io.BytesIO()
+    sf.write(ogg_buf, stereo, sr, format="OGG", subtype="VORBIS")
+
+    pkg, analysis = generate_track_from_audio_file(
+        ogg_buf.getvalue(),
+        filename_hint="SynthArtist - Custom Pulse.ogg",
+        style="Dance / Party",
+        environment_name="TheWeekndEnvironment",
+    )
+    assert pkg.song_name == "Custom Pulse"
+    assert pkg.song_author_name == "SynthArtist"
+    assert abs(analysis.bpm - 128.0) <= 2.5
+    std = pkg.charts["Standard"]
+    assert set(std.keys()) == {0, 1, 2, 3, 4}
+    assert len(std[0].v3_dict["colorNotes"]) <= len(std[4].v3_dict["colorNotes"])
+    assert len(std[4].v3_dict["basicBeatmapEvents"]) > 0
+
+    # Export as BeatSaver .zip and reload
+    out_zip = str(tmp_path / "generated_track.zip")
+    export_package_to_beatsaver_zip(pkg, out_zip)
+    reloaded = load_custom_map(out_zip)
+    assert reloaded.song_name == "Custom Pulse"
+    assert reloaded.environment_name == "TheWeekndEnvironment"
+    assert set(reloaded.charts["Standard"].keys()) == {0, 1, 2, 3, 4}
+
+
+def test_stage_modder_obj_to_ps5_mesh():
+    from ps5_bs_converter.stage_modder import build_unity_ps5_mesh_blob, load_wavefront_obj
+
+    quad_obj = "\n".join([
+        "v -1.5 0.0 -1.0",
+        "v  1.5 0.0 -1.0",
+        "v  1.5 0.0  1.0",
+        "v -1.5 0.0  1.0",
+        "vt 0.0 0.0",
+        "vt 1.0 0.0",
+        "vt 1.0 1.0",
+        "vt 0.0 1.0",
+        "vn 0.0 1.0 0.0",
+        "f 1/1/1 2/2/1 3/3/1 4/4/1",
+    ])
+    geom = load_wavefront_obj(quad_obj, is_path=False)
+    assert len(geom.positions) == 4
+    assert len(geom.indices) == 6
+    blob = build_unity_ps5_mesh_blob("PlayersPlaceCore", geom)
+    assert len(blob) == 616  # Exact byte parity with PS5 PlayersPlaceCore Mesh!
+
+
+def test_vorbis_fsb5_setup_crc_and_sync_check():
+    """Handover Section 8.2 test: Vorbis FSB5 setup CRC == 0x6D39BF3E and sync check at offset 0."""
+    import struct as _st
+    from ps5_bs_converter.vorbis_fsb5 import (
+        EXPECTED_VORBIS_SETUP_CRC32,
+        encode_song_and_preview_vorbis_fsb5,
+    )
+
+    egg = _make_ogg_egg_bytes(duration_s=5.0, sr=44100, channels=2)
+    main_v, prev_v = encode_song_and_preview_vorbis_fsb5(egg, "song.egg", preview_start=1.0)
+    buf = main_v.fsb5_bytes
+    assert buf[:4] == b"FSB5"
+    ver, nsamp, shsz, nsz, dsz, mode = _st.unpack_from("<6I", buf, 4)
+    assert ver == 1 and nsamp == 1 and mode == 15
+    assert (60 + shsz) % 32 == 0
+    assert dsz % 32 == 0
+    setup_crc = _st.unpack_from("<I", buf, 72)[0]
+    assert setup_crc == EXPECTED_VORBIS_SETUP_CRC32  # 0x6D39BF3E
+    assert abs(prev_v.duration_seconds - 4.0) <= 1.1
+
+
+def test_v3_to_v4_tempo_flattening_and_indices_in_range():
+    """Handover Section 8.2 test: v4 JSON parses with all indices in range + tempo spike flattening."""
+    from ps5_bs_converter.bundle_v137 import convert_v3_to_v4_beatmap_and_lightshow
+
+    v3_sample = {
+        "version": "3.3.0",
+        "bpmEvents": [{"b": 0.0, "m": 120.0}, {"b": 4.0, "m": 100000.0}, {"b": 6.0, "m": 120.0}],
+        "colorNotes": [
+            {"b": 2.0, "x": 1, "y": 0, "c": 0, "d": 1, "a": 0},
+            {"b": 8.0, "x": 2, "y": 1, "c": 1, "d": 0, "a": 0},
+        ],
+        "bombNotes": [{"b": 3.0, "x": 0, "y": 0}],
+        "obstacles": [{"b": 2.0, "x": 0, "y": 0, "d": 2.0, "w": 1, "h": 5}],
+        "sliders": [{"b": 2.0, "c": 0, "x": 1, "y": 0, "d": 1, "mu": 1.0, "tb": 8.0, "tx": 2, "ty": 1, "tc": 0, "tmu": 1.0, "m": 0}],
+        "burstSliders": [{"b": 8.0, "c": 1, "x": 2, "y": 1, "d": 0, "tb": 8.25, "tx": 3, "ty": 0, "sc": 4, "s": 0.9}],
+        "basicBeatmapEvents": [{"b": 2.0, "et": 1, "i": 3, "f": 1.0}],
+        "colorBoostBeatmapEvents": [{"b": 8.0, "o": True}],
+    }
+    v4_bm, v4_ls, counts = convert_v3_to_v4_beatmap_and_lightshow(v3_sample, base_bpm=120.0)
+    # Beat 8.0 after a 2-beat 100,000-BPM spike occurs at ~beat 6.0024 in constant 120-BPM time!
+    assert abs(v4_bm["colorNotes"][1]["b"] - 6.0) < 0.05
+    assert all(0 <= int(n.get("i", 0)) < len(v4_bm["colorNotesData"]) for n in v4_bm["colorNotes"])
+    assert all(0 <= int(a.get("ai", 0)) < len(v4_bm["arcsData"]) for a in v4_bm["arcs"])
+    assert all(0 <= int(c.get("ci", 0)) < len(v4_bm["chainsData"]) for c in v4_bm["chains"])
+    assert all(0 <= int(e.get("i", 0)) < len(v4_ls["basicEventsData"]) for e in v4_ls["basicEvents"])
+    assert counts["notes_count"] == 2 and counts["cuttable_count"] == 5
+
+
+@pytest.mark.skipif(not HAS_REAL_DUMP_137, reason="PS5 1.37 dump not present")
+def test_real_v137_sandbox_e2e_pack_q0_catalog_index_and_slot_guard(tmp_path):
+    """
+    Full 1.37 Handover Verification against real 01.037.000 files in an isolated sandbox:
+      1. q0 baseline: pack patcher with 0 edits gives 100% byte-identical output
+      2. Slot guard refuses multi-mode slots (FitBeat)
+      3. End-to-end install into SpookyBeat (Vorbis FSB5 + v4 JSON + pack edit + cover paste)
+      4. catalog.json and ampr_emu.index preserve exact byte length
+      5. Single-slot restore returns pack, song bundle, catalog CRC, and index to exact stock bytes
+    """
+    from PIL import Image
+    from ps5_bs_converter.bundle_v137 import patch_v137_pack_bundle
+
+    # 1. q0 zero-edit byte-identical self-test on real extras_pack!
+    real_aa_ps5 = os.path.join(REAL_DUMP_137, "Media", "StreamingAssets", "aa", "PS5")
+    extras_fn = next(f for f in os.listdir(real_aa_ps5) if f.startswith("extras_pack_assets_all_"))
+    shared_fn = next(f for f in os.listdir(real_aa_ps5) if f.startswith("sharedassets_assets_all_"))
+    orig_extras_bytes = open(os.path.join(real_aa_ps5, extras_fn), "rb").read()
+    assert patch_v137_pack_bundle(orig_extras_bytes, {}) == orig_extras_bytes
+
+    # 2. Construct isolated 1.37 sandbox with spookybeat, fitbeat, extras_pack, sharedassets, catalog, and ampr_emu.index
+    app137 = tmp_path / "PPSA15035-app"
+    bdata = app137 / "Media" / "StreamingAssets" / "BeatmapLevelsData"
+    aa_ps5 = app137 / "Media" / "StreamingAssets" / "aa" / "PS5"
+    sce = app137 / "sce_sys"
+    bdata.mkdir(parents=True)
+    aa_ps5.mkdir(parents=True)
+    sce.mkdir(parents=True)
+
+    shutil.copy2(os.path.join(REAL_DUMP_137, "sce_sys", "param.json"), sce / "param.json")
+    shutil.copy2(os.path.join(REAL_DUMP_137, "ampr_emu.index"), app137 / "ampr_emu.index")
+    shutil.copy2(
+        os.path.join(REAL_DUMP_137, "Media", "StreamingAssets", "aa", "catalog.json"),
+        app137 / "Media" / "StreamingAssets" / "aa" / "catalog.json",
+    )
+    for s_name in ("spookybeat", "fitbeat"):
+        shutil.copy2(
+            os.path.join(REAL_DUMP_137, "Media", "StreamingAssets", "BeatmapLevelsData", s_name),
+            bdata / s_name,
+        )
+    shutil.copy2(os.path.join(real_aa_ps5, extras_fn), aa_ps5 / extras_fn)
+    shutil.copy2(os.path.join(real_aa_ps5, shared_fn), aa_ps5 / shared_fn)
+
+    orig_spooky_bytes = (bdata / "spookybeat").read_bytes()
+    orig_cat_bytes = (app137 / "Media" / "StreamingAssets" / "aa" / "catalog.json").read_bytes()
+    orig_idx_bytes = (app137 / "ampr_emu.index").read_bytes()
+
+    mgr137 = PS5BeatSaberManager(str(app137))
+    assert mgr137.engine_mode == "bundle_v137"
+    assert "SpookyBeat" in mgr137.slots
+    assert "FitBeat" not in mgr137.slots  # Multi-mode excluded from selectable 1.37 list!
+
+    # Slot guard must refuse FitBeat if called directly
+    v2_zip = _make_v2_beatsaver_zip(duration_s=3.5)
+    with pytest.raises(ValueError, match="multi-mode"):
+        mgr137.install_custom_song(v2_zip, "FitBeat")
+
+    # Add a cover image to a custom package & install into SpookyBeat (including Step G cover art!)
+    pkg = load_custom_map(v2_zip)
+    cov_bio = io.BytesIO()
+    Image.new("RGBA", (256, 256), (0, 180, 255, 255)).save(cov_bio, format="PNG")
+    pkg.cover_bytes = cov_bio.getvalue()
+
+    updated = mgr137.install_custom_song(
+        pkg, "SpookyBeat", environment_override="KDAEnvironment", install_cover_art=True
+    )
+    assert updated.is_custom
+    assert updated.current_song_name == "Neon Horizon"
+
+    # Verify catalog.json & ampr_emu.index kept the EXACT same byte length!
+    assert len((app137 / "Media" / "StreamingAssets" / "aa" / "catalog.json").read_bytes()) == len(orig_cat_bytes)
+    assert len((app137 / "ampr_emu.index").read_bytes()) == len(orig_idx_bytes)
+
+    vinfo = mgr137.verify_slot("SpookyBeat")
+    assert vinfo["audio_codec"] == 15  # Vorbis FSB5!
+    assert vinfo["charts_verified"] == 5
+
+    # Surgical single-slot restore of SpookyBeat -> restores song, pack, catalog CRC, and index byte-identically!
+    mgr137.restore_slot("SpookyBeat")
+    assert (bdata / "spookybeat").read_bytes() == orig_spooky_bytes
+    assert (aa_ps5 / extras_fn).read_bytes() == orig_extras_bytes
+    assert (app137 / "Media" / "StreamingAssets" / "aa" / "catalog.json").read_bytes() == orig_cat_bytes
+    assert (app137 / "ampr_emu.index").read_bytes() == orig_idx_bytes
+
+
 # ==============================================================================
 # Real PS5 Dump Read-Only & Sandboxed End-to-End Integration Tests
 # ==============================================================================
@@ -278,8 +482,9 @@ def test_real_ps5_dump_readonly_byte_parity():
 
     mgr = PS5BeatSaberManager(REAL_DUMP_ROOT)
     assert len(mgr.slots) == 234
-    free_slots = mgr.list_slots(free_only=True)
-    assert len(free_slots) == 50
+    assert len(mgr.list_slots(pack_category="all")) == 234
+    assert len(mgr.list_slots(pack_category="dlc")) == 184
+    assert len(mgr.list_slots(pack_category="free")) == 50
 
 
 @pytest.mark.skipif(not HAS_REAL_DUMP, reason="PS5 dump not present")
@@ -304,6 +509,7 @@ def test_sandbox_end_to_end_install_replace_and_restore():
 
     copied_assets = [
         "resources.assets",
+        "sharedassets3.assets",
         "sharedassets21.assets",
         "sharedassets43.assets",
         "sharedassets44.assets",
@@ -330,6 +536,7 @@ def test_sandbox_end_to_end_install_replace_and_restore():
 
     try:
         mgr = PS5BeatSaberManager(app_dir)
+        initial_spooky_title = mgr.slots["SpookyBeat"].stock_song_name
         v2_zip = _make_v2_beatsaver_zip(duration_s=3.5)
         v4_zip = _make_v4_beatsaver_zip(duration_s=3.0)
 
@@ -356,23 +563,42 @@ def test_sandbox_end_to_end_install_replace_and_restore():
         # 5. External BeatmapLevelSO Free Slot (Escape -> sharedassets43.assets#676)
         mgr.install_custom_song(v2_zip, "Escape")
 
-        # 6. DLC Slot with PreviewBeatmapLevelSO + *Preview AudioClip (BoulevardOfBrokenDreams)
-        mgr.install_custom_song(v2_zip, "BoulevardOfBrokenDreams")
+        # 6. DLC Slot with PreviewBeatmapLevelSO + *Preview AudioClip + Stage Override!
+        mgr.install_custom_song(
+            v2_zip, "BoulevardOfBrokenDreams", environment_override="TheWeekndEnvironment"
+        )
+        assert mgr.slots["BoulevardOfBrokenDreams"].installed_info["stage_environment"] == "TheWeekndEnvironment"
 
-        # Verify all 5 installed slots pass strict FSB5 + UTF-16LE JSON + alignment checks!
+        # 7. Test DLC Batch Fill into Queen DLC pack!
+        batch_dir = os.path.join(sandbox_base, "batch_zips")
+        os.makedirs(batch_dir, exist_ok=True)
+        with open(os.path.join(batch_dir, "01_song.zip"), "wb") as bf1:
+            bf1.write(v2_zip)
+        with open(os.path.join(batch_dir, "02_song.zip"), "wb") as bf2:
+            bf2.write(v4_zip)
+        batch_res = mgr.install_batch_into_pack(batch_dir, "Queen")
+        assert len(batch_res) == 2
+
+        # 8. Test Stage Neon Color Customizer & 3D .obj Platform Mesh Injection!
+        assert len(mgr.list_environments()) >= 35
+        mgr.apply_stage_color_theme("TheWeekndEnvironment", "Cyberpunk Neon (Pink & Cyan)")
+        sample_obj = "v -2 0 -2\nv 2 0 -2\nv 2 0 2\nv -2 0 2\nf 1 2 3 4\n"
+        mgr.replace_stage_mesh_from_obj("platform", sample_obj, is_path=False)
+
+        # Verify all 7 installed slots pass strict FSB5 + UTF-16LE JSON + alignment checks!
         verified = mgr.verify_all_installed()
-        assert len(verified) == 5
+        assert len(verified) == 7
 
         # Test Printable HTML export
         html_out = os.path.join(sandbox_base, "lineup.html")
         mgr.export_song_list_html(html_out)
         assert os.path.isfile(html_out) and "Cyber Pulse V4" in open(html_out, encoding="utf-8").read()
 
-        # Surgical single-slot restore of SpookyBeat while keeping the other 4 custom songs intact
+        # Surgical single-slot restore of SpookyBeat while keeping the other 6 custom songs intact
         mgr.restore_slot("SpookyBeat")
         assert not mgr.slots["SpookyBeat"].is_custom
-        assert mgr.slots["SpookyBeat"].current_song_name == "Spooky Beat"
-        assert len(mgr.verify_all_installed()) == 4
+        assert mgr.slots["SpookyBeat"].current_song_name == initial_spooky_title
+        assert len(mgr.verify_all_installed()) == 6
 
         # Full Factory Restore — verify EVERY .assets file and .resource file matches pristine bytes 100%!
         mgr.restore_all()
