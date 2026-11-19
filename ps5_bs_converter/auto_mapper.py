@@ -35,7 +35,7 @@ from .beatmap_converter import (
     _sort_v3_arrays,
 )
 
-STYLE_PRESETS = ("Balanced Flow", "Dance / Party", "Tech / High-Intensity")
+STYLE_PRESETS = ("Balanced Flow", "Dance / Party", "Tech / High-Intensity", "Joyful / Chilled")
 
 # Forehand (downward) vs Backhand (upward) cut directions:
 # 0=Up, 1=Down, 2=Left, 3=Right, 4=UpLeft, 5=UpRight, 6=DownLeft, 7=DownRight, 8=Dot
@@ -136,8 +136,16 @@ def analyze_audio_rhythm(
     usable_dur = max(0.5, duration - beat_offset - 0.25)
     total_beats = usable_dur * (bpm / 60.0)
     num_steps = max(4, int(math.floor(total_beats * 4.0)))
-    grid_beats = np.arange(num_steps, dtype=np.float64) * 0.25
-    grid_times = beat_offset + grid_beats * beat_period
+    grid_steps = np.arange(num_steps, dtype=np.float64) * 0.25
+    grid_times = beat_offset + grid_steps * beat_period
+
+    # ABSOLUTE-BEAT ANCHORING (fixes auto-made maps arriving early):
+    # grid beat b maps to song time beat_offset + b*beat_period, i.e. the
+    # beat grid's true phase. Notes written at these beats land exactly on
+    # the detected beats of the audio with NO reliance on `_songTimeOffset`
+    # (whose sign convention previously shifted notes early by up to
+    # 2x the beat phase). `song_time_offset` is now emitted as 0.
+    grid_beats = grid_times * (bpm / 60.0)
 
     half_win = max(1, int(round(0.045 * fps)))  # ±45ms transient capture window
 
@@ -304,8 +312,17 @@ def _generate_difficulty_v3(
     v3["colorBoostBeatmapEvents"] = list(boost_events)
     v3["useNormalEventsAsCompatibleEvents"] = True
 
-    style_mult = 1.18 if style == "Tech / High-Intensity" else (0.95 if style == "Dance / Party" else 1.0)
+    style_mult = (
+        1.18
+        if style == "Tech / High-Intensity"
+        else 0.95
+        if style == "Dance / Party"
+        else 0.82
+        if style == "Joyful / Chilled"
+        else 1.0
+    )
     wide_dance = style == "Dance / Party"
+    joyful = style == "Joyful / Chilled"
 
     # Target max Notes-Per-Second & allowed grid subdivisions per difficulty
     base_nps = {0: 1.25, 1: 2.15, 2: 3.35, 3: 4.85, 4: 6.60}[diff_int] * style_mult
@@ -410,7 +427,10 @@ def _generate_difficulty_v3(
                 else:
                     y = 2 if (energy >= 0.60 and rng.random() < 0.40) else (1 if rng.random() < 0.65 else 0)
                 # Use diagonals & horizontals more on higher difficulties / Dance style
-                diag_prob = 0.55 if (wide_dance or style == "Tech / High-Intensity") else 0.35
+                diag_prob = (
+                    0.30 if joyful
+                    else (0.55 if (wide_dance or style == "Tech / High-Intensity") else 0.35)
+                )
                 if len(hands_to_place) == 2:
                     # Keep simultaneous chords parallel/symmetric for comfort!
                     d = 1 if is_fh else 0
@@ -458,7 +478,8 @@ def _generate_difficulty_v3(
 
         # Optional Side Dodge Walls on 8-beat phrase starts in Hard+ (or Dance mode Normal+)
         min_wall_diff = 1 if wide_dance else 2
-        if diff_int >= min_wall_diff and idx % 32 == 0 and energy >= 0.55 and rng.random() < 0.35:
+        wall_prob = 0.20 if joyful else 0.35
+        if diff_int >= min_wall_diff and idx % 32 == 0 and energy >= 0.55 and rng.random() < wall_prob:
             wall_x = 0 if (int(b // 8) % 2 == 0) else 3
             # Ensure we didn't just place a note inside wall_x!
             if all(n["x"] != wall_x for n in placed_this_beat):
@@ -467,7 +488,8 @@ def _generate_difficulty_v3(
                 )
 
         # Optional Bomb accents in Hard+ on off-lanes during medium/high energy
-        if diff_int >= 2 and len(placed_this_beat) == 1 and sub == 0 and energy >= 0.60 and rng.random() < 0.12:
+        bomb_prob = 0.05 if joyful else 0.12
+        if diff_int >= 2 and len(placed_this_beat) == 1 and sub == 0 and energy >= 0.60 and rng.random() < bomb_prob:
             n0 = placed_this_beat[0]
             bx = 3 - n0["x"]
             by = 0 if n0["y"] > 0 else 2
@@ -574,7 +596,7 @@ def generate_track_from_audio_file(
         song_author_name=(song_author or auto_artist).strip() or "Custom Artist",
         level_author_name=mapper_name.strip() or "AutoMapper Studio",
         bpm=analysis.bpm,
-        song_time_offset=-analysis.beat_offset_seconds,
+        song_time_offset=0.0,  # absolute-beat anchoring; no time offset needed
         shuffle=0.0,
         shuffle_period=0.5,
         preview_start_time=analysis.preview_start_seconds,

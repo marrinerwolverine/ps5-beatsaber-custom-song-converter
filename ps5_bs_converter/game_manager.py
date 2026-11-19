@@ -35,6 +35,7 @@ from .bundle_v137 import (
     update_ampr_index_sizes,
 )
 from .covers_v137 import patch_sharedassets_covers
+from .exfat_container import ExfatBackportContainer, find_exfat_image
 from .vorbis_fsb5 import encode_song_and_preview_vorbis_fsb5
 from .stage_modder import STAGE_MESH_TARGETS, build_unity_ps5_mesh_blob, load_wavefront_obj
 from .unity_assets import (
@@ -199,22 +200,37 @@ class PS5BeatSaberManager:
     """Manages custom song installation, backups, restoration, and verification on a PS5 dump."""
 
     def __init__(self, game_path: str, backup_root: Optional[str] = None):
-        self.app_root = find_ps5_game_root(game_path)
-        self.media_dir = os.path.join(self.app_root, "Media")
-        self.levels_bundle_dir = os.path.join(self.media_dir, "StreamingAssets", "BeatmapLevelsData")
-        self.aa_ps5_dir = os.path.join(self.media_dir, "StreamingAssets", "aa", "PS5")
-        self.catalog_json_path = os.path.join(self.media_dir, "StreamingAssets", "aa", "catalog.json")
-        self.ampr_index_path = os.path.join(self.app_root, "ampr_emu.index")
-
-        # Section 8.1 Detection:
-        # if Media/sharedassets48.assets exists -> 1.12 path (unchanged)
-        # elif StreamingAssets/BeatmapLevelsData/ + aa/catalog.json -> 1.37 backend
-        if os.path.isfile(os.path.join(self.media_dir, "sharedassets48.assets")):
-            self.engine_mode = "assets_v134"
-        elif os.path.isdir(self.levels_bundle_dir) and os.path.isfile(self.catalog_json_path):
+        # 1.37 Backport `.exfat` container support: the game may live inside a
+        # raw exFAT image (AMPRIDX3 master index + size-derived 64KB-aligned
+        # payload). All v137 file access then goes through the container.
+        self.container: Optional[ExfatBackportContainer] = None
+        img_path = find_exfat_image(game_path)
+        if img_path:
+            self.container = ExfatBackportContainer(img_path)
+            self.app_root = img_path
+            self.media_dir = os.path.join(self.app_root, "Media")
+            self.levels_bundle_dir = os.path.join(self.media_dir, "StreamingAssets", "BeatmapLevelsData")
+            self.aa_ps5_dir = os.path.join(self.media_dir, "StreamingAssets", "aa", "PS5")
+            self.catalog_json_path = os.path.join(self.media_dir, "StreamingAssets", "aa", "catalog.json")
+            self.ampr_index_path = os.path.join(self.app_root, "ampr_emu.index")
             self.engine_mode = "bundle_v137"
         else:
-            raise FileNotFoundError(f"Unrecognized Beat Saber layout in {self.app_root}")
+            self.app_root = find_ps5_game_root(game_path)
+            self.media_dir = os.path.join(self.app_root, "Media")
+            self.levels_bundle_dir = os.path.join(self.media_dir, "StreamingAssets", "BeatmapLevelsData")
+            self.aa_ps5_dir = os.path.join(self.media_dir, "StreamingAssets", "aa", "PS5")
+            self.catalog_json_path = os.path.join(self.media_dir, "StreamingAssets", "aa", "catalog.json")
+            self.ampr_index_path = os.path.join(self.app_root, "ampr_emu.index")
+
+            # Section 8.1 Detection:
+            # if Media/sharedassets48.assets exists -> 1.12 path (unchanged)
+            # elif StreamingAssets/BeatmapLevelsData/ + aa/catalog.json -> 1.37 backend
+            if os.path.isfile(os.path.join(self.media_dir, "sharedassets48.assets")):
+                self.engine_mode = "assets_v134"
+            elif os.path.isdir(self.levels_bundle_dir) and os.path.isfile(self.catalog_json_path):
+                self.engine_mode = "bundle_v137"
+            else:
+                raise FileNotFoundError(f"Unrecognized Beat Saber layout in {self.app_root}")
 
         self.title_id, self.content_version = self._read_param_json()
 
@@ -245,6 +261,14 @@ class PS5BeatSaberManager:
         self.refresh_catalog()
 
     def _read_param_json(self) -> Tuple[str, str]:
+        if self.container is not None:
+            try:
+                if self.container.exists("sce_sys/param.json"):
+                    d = json.loads(self.container.read_bytes("sce_sys/param.json").decode("utf-8", errors="replace"))
+                    return str(d.get("titleId") or "PPSA15035"), str(d.get("contentVersion") or "01.037.000")
+            except Exception:
+                pass
+            return "PPSA15035", "Unknown"
         param_path = os.path.join(self.app_root, "sce_sys", "param.json")
         if os.path.isfile(param_path):
             try:
@@ -254,6 +278,71 @@ class PS5BeatSaberManager:
             except Exception:
                 pass
         return "PPSA15035", "Unknown"
+
+    # ==========================================================================
+    # v137 Storage Shim: transparent folder-vs-.exfat-container file access.
+    # All 1.37 backend reads/writes go through these primitives so backport
+    # `.exfat` images and extracted folder dumps behave identically.
+    # ==========================================================================
+
+    @staticmethod
+    def _song_rel(fn: str) -> str:
+        return f"Media/StreamingAssets/BeatmapLevelsData/{fn}"
+
+    @staticmethod
+    def _pack_rel(fn: str) -> str:
+        return f"Media/StreamingAssets/aa/PS5/{fn}"
+
+    CATALOG_REL = "Media/StreamingAssets/aa/catalog.json"
+    AMPR_REL = "ampr_emu.index"
+
+    def _v137_fs_path(self, rel: str) -> str:
+        return os.path.join(self.app_root, *rel.split("/"))
+
+    def _v137_read(self, rel: str) -> bytes:
+        if self.container is not None:
+            return self.container.read_bytes(rel)
+        with open(self._v137_fs_path(rel), "rb") as f:
+            return f.read()
+
+    def _v137_exists(self, rel: str) -> bool:
+        if self.container is not None:
+            return self.container.exists(rel)
+        return os.path.isfile(self._v137_fs_path(rel))
+
+    def _v137_size(self, rel: str) -> int:
+        if self.container is not None:
+            return self.container.getsize(rel)
+        return os.path.getsize(self._v137_fs_path(rel))
+
+    def _v137_write(self, rel: str, data: bytes) -> None:
+        if self.container is not None:
+            self.container.write_bytes(rel, data)
+            return
+        dst = self._v137_fs_path(rel)
+        os.makedirs(os.path.dirname(dst), exist_ok=True)
+        tmp = dst + ".tmp_write"
+        with open(tmp, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        _safe_replace_file(tmp, dst)
+
+    def _v137_list_aa_ps5(self) -> List[str]:
+        if self.container is not None:
+            prefix = "Media/StreamingAssets/aa/PS5/"
+            return sorted(
+                p[len(prefix):] for p in self.container.list_paths() if p.startswith(prefix)
+            )
+        if os.path.isdir(self.aa_ps5_dir):
+            return sorted(os.listdir(self.aa_ps5_dir))
+        return []
+
+    def close(self) -> None:
+        """Release the `.exfat` container handle (folder dumps need no cleanup)."""
+        if self.container is not None:
+            self.container.close()
+            self.container = None
 
     def _load_state(self) -> dict:
         if os.path.isfile(self.state_path):
@@ -283,16 +372,18 @@ class PS5BeatSaberManager:
             for sub in ("songs_orig", "packs_orig", "previews", "covers"):
                 os.makedirs(os.path.join(self.backup_dir, sub), exist_ok=True)
             cat_bak = os.path.join(self.backup_dir, "catalog.json.orig")
-            if os.path.isfile(self.catalog_json_path) and not os.path.isfile(cat_bak):
+            if self._v137_exists(self.CATALOG_REL) and not os.path.isfile(cat_bak):
                 if log_fn:
                     log_fn("Backing up pristine Addressables aa/catalog.json...")
-                shutil.copy2(self.catalog_json_path, cat_bak)
+                with open(cat_bak, "wb") as f:
+                    f.write(self._v137_read(self.CATALOG_REL))
                 changed = True
             idx_bak = os.path.join(self.backup_dir, "ampr_emu.index.orig")
-            if os.path.isfile(self.ampr_index_path) and not os.path.isfile(idx_bak):
+            if self._v137_exists(self.AMPR_REL) and not os.path.isfile(idx_bak):
                 if log_fn:
                     log_fn("Backing up pristine ampr_emu.index...")
-                shutil.copy2(self.ampr_index_path, idx_bak)
+                with open(idx_bak, "wb") as f:
+                    f.write(self._v137_read(self.AMPR_REL))
                 changed = True
             if changed or not os.path.isfile(self.state_path):
                 self._save_state()
@@ -532,23 +623,24 @@ class PS5BeatSaberManager:
             import UnityPy
 
             cached_rows: List[dict] = []
-            if os.path.isdir(self.aa_ps5_dir):
-                for fn in sorted(os.listdir(self.aa_ps5_dir)):
-                    if "_pack_assets_all_" not in fn or fn.startswith("debug_"):
-                        continue
-                    bak_pack = os.path.join(self.backup_dir, "packs_orig", fn + ".orig")
-                    src_pack = bak_pack if os.path.isfile(bak_pack) else os.path.join(self.aa_ps5_dir, fn)
-                    with open(src_pack, "rb") as _pf:
-                        env = UnityPy.load(_pf.read())
-                    bf = list(env.files.values())[0]
-                    cab = bf.files[[k for k in bf.files if not k.endswith((".resource", ".resS"))][0]]
-
+            self.catalog_warnings: List[str] = []
+            for fn in sorted(self._v137_list_aa_ps5()):
+                if "_pack_assets_all_" not in fn or fn.startswith("debug_"):
+                    continue
+                bak_pack = os.path.join(self.backup_dir, "packs_orig", fn + ".orig")
+                if os.path.isfile(bak_pack):
+                    pack_bytes = open(bak_pack, "rb").read()
+                else:
+                    pack_bytes = self._v137_read(self._pack_rel(fn))
+                try:
+                    env = UnityPy.load(pack_bytes)
                     pack_id = fn.split("_pack_assets_all_")[0]
                     pack_name = pack_id
                     is_free = pack_id.lower().startswith(("ostvol", "extras", "camellia"))
                     levels_in_pack = []
-
-                    for _pid, rdr in cab.objects.items():
+                    # Iterate ALL objects across every CAB in the bundle: pack bundles
+                    # vary in internal structure (single/multi-CAB + .resource streams).
+                    for rdr in env.objects:
                         if rdr.type.name != "MonoBehaviour":
                             continue
                         tt = rdr.read_typetree()
@@ -559,35 +651,42 @@ class PS5BeatSaberManager:
                                 is_free = True
                         elif "_levelID" in tt and "_previewDifficultyBeatmapSets" in tt:
                             levels_in_pack.append(tt)
+                except Exception as exc:
+                    # Tolerate damaged bundles (e.g. a corrupt DLC pack inside a backport
+                    # .exfat image): skip that pack's slots instead of failing the whole load.
+                    self.catalog_warnings.append(
+                        f"Skipped unreadable level-pack bundle '{fn}' ({exc.__class__.__name__}: {exc})"
+                    )
+                    continue
 
-                    for ltt in levels_in_pack:
-                        lid = str(ltt["_levelID"])
-                        song_fn = lid.lower()
-                        if not os.path.isfile(os.path.join(self.levels_bundle_dir, song_fn)):
-                            continue
-                        psets = ltt.get("_previewDifficultyBeatmapSets") or []
-                        is_std_5 = (
-                            len(psets) == 1
-                            and len(psets[0].get("_previewDifficultyBeatmaps") or []) == 5
-                        )
-                        cov_pid = int((ltt.get("_coverImage") or {}).get("m_PathID", 0))
-                        cached_rows.append(
-                            {
-                                "level_id": lid,
-                                "song_fn": song_fn,
-                                "pack_fn": fn,
-                                "pack_id": pack_id,
-                                "pack_name": pack_name,
-                                "is_free": is_free,
-                                "song_name": str(ltt.get("_songName", lid)),
-                                "song_sub": str(ltt.get("_songSubName", "")),
-                                "song_author": str(ltt.get("_songAuthorName", "")),
-                                "level_author": str(ltt.get("_levelAuthorName", "")),
-                                "bpm": float(ltt.get("_beatsPerMinute", 120.0)),
-                                "cover_pid": cov_pid,
-                                "is_std_5": is_std_5,
-                            }
-                        )
+                for ltt in levels_in_pack:
+                    lid = str(ltt["_levelID"])
+                    song_fn = lid.lower()
+                    if not self._v137_exists(self._song_rel(song_fn)):
+                        continue
+                    psets = ltt.get("_previewDifficultyBeatmapSets") or []
+                    is_std_5 = (
+                        len(psets) == 1
+                        and len(psets[0].get("_previewDifficultyBeatmaps") or []) == 5
+                    )
+                    cov_pid = int((ltt.get("_coverImage") or {}).get("m_PathID", 0))
+                    cached_rows.append(
+                        {
+                            "level_id": lid,
+                            "song_fn": song_fn,
+                            "pack_fn": fn,
+                            "pack_id": pack_id,
+                            "pack_name": pack_name,
+                            "is_free": is_free,
+                            "song_name": str(ltt.get("_songName", lid)),
+                            "song_sub": str(ltt.get("_songSubName", "")),
+                            "song_author": str(ltt.get("_songAuthorName", "")),
+                            "level_author": str(ltt.get("_levelAuthorName", "")),
+                            "bpm": float(ltt.get("_beatsPerMinute", 120.0)),
+                            "cover_pid": cov_pid,
+                            "is_std_5": is_std_5,
+                        }
+                    )
             self._v137_pristine_slots_cache = cached_rows
 
         installed_map = self.state.get("installed_slots", {})
@@ -1077,17 +1176,21 @@ class PS5BeatSaberManager:
         if not pack_fn:
             raise RuntimeError(f"Missing pack bundle mapping for 1.37 slot '{slot.level_id}'")
 
-        live_song_path = os.path.join(self.levels_bundle_dir, song_fn)
+        live_song_rel = self._song_rel(song_fn)
         bak_song_path = os.path.join(self.backup_dir, "songs_orig", song_fn + ".orig")
         if not os.path.isfile(bak_song_path):
             log(f"Backing up pristine song bundle '{song_fn}'...")
-            shutil.copy2(live_song_path, bak_song_path)
+            os.makedirs(os.path.dirname(bak_song_path), exist_ok=True)
+            with open(bak_song_path, "wb") as f:
+                f.write(self._v137_read(live_song_rel))
 
-        live_pack_path = os.path.join(self.aa_ps5_dir, pack_fn)
+        live_pack_rel = self._pack_rel(pack_fn)
         bak_pack_path = os.path.join(self.backup_dir, "packs_orig", pack_fn + ".orig")
         if not os.path.isfile(bak_pack_path):
             log(f"Backing up pristine level-pack bundle '{pack_fn}'...")
-            shutil.copy2(live_pack_path, bak_pack_path)
+            os.makedirs(os.path.dirname(bak_pack_path), exist_ok=True)
+            with open(bak_pack_path, "wb") as f:
+                f.write(self._v137_read(live_pack_rel))
 
         # Step B: Encode Vorbis FSB5 (0x6D39BF3E setup CRC + 0-sample sync check) + 10s preview
         log("Encoding Vorbis FSB5 audio (0x6D39BF3E setup CRC + 0-offset sync check)...")
@@ -1115,14 +1218,13 @@ class PS5BeatSaberManager:
         with open(bak_song_path, "rb") as f:
             pristine_song_bytes = f.read()
         new_song_bytes, diff_stats = build_v137_song_bundle(
-            pristine_song_bytes, main_fsb, std_5, pkg.bpm
+            pristine_song_bytes,
+            main_fsb,
+            std_5,
+            pkg.bpm,
+            song_time_offset=pkg.song_time_offset,
         )
-        tmp_s = live_song_path + ".tmp_write"
-        with open(tmp_s, "wb") as f:
-            f.write(new_song_bytes)
-            f.flush()
-            os.fsync(f.fileno())
-        _safe_replace_file(tmp_s, live_song_path)
+        self._v137_write(live_song_rel, new_song_bytes)
 
         # Persist preview .fsb & optional cover image in backup_dir for incremental pack rebuilds
         prev_cache_path = os.path.join(self.backup_dir, "previews", f"{slot.level_id}.preview.fsb")
@@ -1180,9 +1282,7 @@ class PS5BeatSaberManager:
         return self.slots[slot.level_id]
 
     def _find_v137_sharedassets_bundle(self) -> Optional[str]:
-        if not os.path.isdir(self.aa_ps5_dir):
-            return None
-        for fn in os.listdir(self.aa_ps5_dir):
+        for fn in self._v137_list_aa_ps5():
             if fn.startswith("sharedassets_assets_all_") and fn.endswith(".bundle"):
                 return fn
         return None
@@ -1234,90 +1334,71 @@ class PS5BeatSaberManager:
         # Step D: Rebuild each touched pack bundle (or restore pristine if 0 custom slots remain in that pack!)
         for pfn in sorted(touched_packs):
             bak_p = os.path.join(self.backup_dir, "packs_orig", pfn + ".orig")
-            live_p = os.path.join(self.aa_ps5_dir, pfn)
+            live_p_rel = self._pack_rel(pfn)
             if not os.path.isfile(bak_p):
                 continue
             slot_edits = by_pack.get(pfn, {})
             if not slot_edits:
                 log(f"Restoring pristine pack bundle '{pfn}' (no custom slots left in pack)...")
-                if os.path.isfile(live_p):
-                    try:
-                        os.chmod(live_p, 0o666)
-                    except Exception:
-                        pass
-                shutil.copy2(bak_p, live_p)
+                with open(bak_p, "rb") as f:
+                    self._v137_write(live_p_rel, f.read())
             else:
                 log(f"Patching level-pack bundle '{pfn}' ({len(slot_edits)} custom song(s))...")
                 pristine_pk = open(bak_p, "rb").read()
                 new_pk = patch_v137_pack_bundle(pristine_pk, slot_edits)
-                tmp_pk = live_p + ".tmp_write"
-                with open(tmp_pk, "wb") as f:
-                    f.write(new_pk)
-                    f.flush()
-                    os.fsync(f.fileno())
-                _safe_replace_file(tmp_pk, live_p)
+                self._v137_write(live_p_rel, new_pk)
 
         # Optional Step G: Rebuild sharedassets SongArtworks BC7 cover atlas if requested
         sa_bundle_fn = self._find_v137_sharedassets_bundle()
         if sa_bundle_fn and (rebuild_covers or os.path.isfile(os.path.join(self.backup_dir, "packs_orig", sa_bundle_fn + ".orig"))):
-            live_sa = os.path.join(self.aa_ps5_dir, sa_bundle_fn)
+            live_sa_rel = self._pack_rel(sa_bundle_fn)
             bak_sa = os.path.join(self.backup_dir, "packs_orig", sa_bundle_fn + ".orig")
             if active_covers:
                 if not os.path.isfile(bak_sa):
                     log(f"Backing up pristine '{sa_bundle_fn}' before cover paste...")
-                    shutil.copy2(live_sa, bak_sa)
+                    os.makedirs(os.path.dirname(bak_sa), exist_ok=True)
+                    with open(bak_sa, "wb") as f:
+                        f.write(self._v137_read(live_sa_rel))
                 if rebuild_covers:
                     log(f"Pasting {len(active_covers)} custom cover(s) into PS5 tiled BC7 SongArtworks atlas...")
                     patched_sa = patch_sharedassets_covers(open(bak_sa, "rb").read(), active_covers)
-                    tmp_sa = live_sa + ".tmp_write"
-                    with open(tmp_sa, "wb") as f:
-                        f.write(patched_sa)
-                    _safe_replace_file(tmp_sa, live_sa)
+                    self._v137_write(live_sa_rel, patched_sa)
             elif os.path.isfile(bak_sa):
-                if os.path.isfile(live_sa):
-                    os.chmod(live_sa, 0o666)
-                shutil.copy2(bak_sa, live_sa)
+                with open(bak_sa, "rb") as f:
+                    self._v137_write(live_sa_rel, f.read())
 
         # Step E: Same-length aa/catalog.json m_Crc = 0 for active modified packs (+ sharedassets if covers active)
         cat_bak = os.path.join(self.backup_dir, "catalog.json.orig")
-        if os.path.isfile(cat_bak) and os.path.isfile(self.catalog_json_path):
+        if os.path.isfile(cat_bak) and self._v137_exists(self.CATALOG_REL):
             crc_off_targets = list(by_pack.keys())
             if active_covers and sa_bundle_fn:
                 crc_off_targets.append(sa_bundle_fn)
             orig_cat_txt = open(cat_bak, "r", encoding="utf-8").read()
             new_cat_txt = set_catalog_crc_zero_same_length(orig_cat_txt, crc_off_targets)
-            tmp_c = self.catalog_json_path + ".tmp_write"
-            with open(tmp_c, "w", encoding="utf-8", newline="") as f:
-                f.write(new_cat_txt)
-            _safe_replace_file(tmp_c, self.catalog_json_path)
+            self._v137_write(self.CATALOG_REL, new_cat_txt.encode("utf-8"))
             log(f"Updated aa/catalog.json (m_Crc=0 on {len(crc_off_targets)} bundle(s), exact length preserved).")
 
         # Step F: Update recorded file sizes in ampr_emu.index (if backport index exists at app_root)
         idx_bak = os.path.join(self.backup_dir, "ampr_emu.index.orig")
-        if os.path.isfile(idx_bak) and os.path.isfile(self.ampr_index_path):
+        if os.path.isfile(idx_bak) and self._v137_exists(self.AMPR_REL):
             size_updates: Dict[str, int] = {}
             for lid, info in installed.items():
                 sfn = info.get("song_bundle_file") or lid.lower()
-                sp = os.path.join(self.levels_bundle_dir, sfn)
-                if os.path.isfile(sp):
-                    size_updates[f"Media/StreamingAssets/BeatmapLevelsData/{sfn}"] = os.path.getsize(sp)
+                srel = self._song_rel(sfn)
+                if self._v137_exists(srel):
+                    size_updates[f"Media/StreamingAssets/BeatmapLevelsData/{sfn}"] = self._v137_size(srel)
             for pfn in by_pack.keys():
-                pp = os.path.join(self.aa_ps5_dir, pfn)
-                if os.path.isfile(pp):
-                    size_updates[f"Media/StreamingAssets/aa/PS5/{pfn}"] = os.path.getsize(pp)
+                prel = self._pack_rel(pfn)
+                if self._v137_exists(prel):
+                    size_updates[f"Media/StreamingAssets/aa/PS5/{pfn}"] = self._v137_size(prel)
             if active_covers and sa_bundle_fn:
-                sap = os.path.join(self.aa_ps5_dir, sa_bundle_fn)
-                if os.path.isfile(sap):
-                    size_updates[f"Media/StreamingAssets/aa/PS5/{sa_bundle_fn}"] = os.path.getsize(sap)
+                sare = self._pack_rel(sa_bundle_fn)
+                if self._v137_exists(sare):
+                    size_updates[f"Media/StreamingAssets/aa/PS5/{sa_bundle_fn}"] = self._v137_size(sare)
 
             orig_idx_bytes = open(idx_bak, "rb").read()
             new_idx_bytes = update_ampr_index_sizes(orig_idx_bytes, size_updates)
-            tmp_i = self.ampr_index_path + ".tmp_write"
-            with open(tmp_i, "wb") as f:
-                f.write(new_idx_bytes)
-                f.flush()
-                os.fsync(f.fileno())
-            _safe_replace_file(tmp_i, self.ampr_index_path)
+            self._v137_write(self.AMPR_REL, new_idx_bytes)
             log(f"Updated ampr_emu.index recorded file sizes ({len(size_updates)} file entries synced).")
 
     # ==========================================================================
@@ -1436,14 +1517,9 @@ class PS5BeatSaberManager:
             song_fn = slot.level_assets_file
             pack_fn = slot.pack_bundle_file or ""
             bak_s = os.path.join(self.backup_dir, "songs_orig", song_fn + ".orig")
-            dst_s = os.path.join(self.levels_bundle_dir, song_fn)
             if os.path.isfile(bak_s):
-                if os.path.isfile(dst_s):
-                    try:
-                        os.chmod(dst_s, 0o666)
-                    except Exception:
-                        pass
-                shutil.copy2(bak_s, dst_s)
+                with open(bak_s, "rb") as f:
+                    self._v137_write(self._song_rel(song_fn), f.read())
             for p_del in (
                 os.path.join(self.backup_dir, "previews", f"{slot.level_id}.preview.fsb"),
                 os.path.join(self.backup_dir, "covers", f"{slot.level_id}.cover.bin"),
@@ -1533,18 +1609,22 @@ class PS5BeatSaberManager:
             if os.path.isdir(sdir):
                 for fn in os.listdir(sdir):
                     if fn.endswith(".orig"):
-                        shutil.copy2(os.path.join(sdir, fn), os.path.join(self.levels_bundle_dir, fn[:-5]))
+                        with open(os.path.join(sdir, fn), "rb") as f:
+                            self._v137_write(self._song_rel(fn[:-5]), f.read())
             pdir = os.path.join(self.backup_dir, "packs_orig")
             if os.path.isdir(pdir):
                 for fn in os.listdir(pdir):
                     if fn.endswith(".orig"):
-                        shutil.copy2(os.path.join(pdir, fn), os.path.join(self.aa_ps5_dir, fn[:-5]))
+                        with open(os.path.join(pdir, fn), "rb") as f:
+                            self._v137_write(self._pack_rel(fn[:-5]), f.read())
             cat_bak = os.path.join(self.backup_dir, "catalog.json.orig")
-            if os.path.isfile(cat_bak) and os.path.isfile(self.catalog_json_path):
-                shutil.copy2(cat_bak, self.catalog_json_path)
+            if os.path.isfile(cat_bak) and self._v137_exists(self.CATALOG_REL):
+                with open(cat_bak, "rb") as f:
+                    self._v137_write(self.CATALOG_REL, f.read())
             idx_bak = os.path.join(self.backup_dir, "ampr_emu.index.orig")
-            if os.path.isfile(idx_bak) and os.path.isfile(self.ampr_index_path):
-                shutil.copy2(idx_bak, self.ampr_index_path)
+            if os.path.isfile(idx_bak) and self._v137_exists(self.AMPR_REL):
+                with open(idx_bak, "rb") as f:
+                    self._v137_write(self.AMPR_REL, f.read())
             for sub in ("previews", "covers"):
                 sub_p = os.path.join(self.backup_dir, sub)
                 if os.path.isdir(sub_p):
@@ -1752,7 +1832,11 @@ class PS5BeatSaberManager:
             import UnityPy as _upy
 
             bpath = os.path.join(self.levels_bundle_dir, slot.level_assets_file)
-            ub = UnityFsBundle.from_bytes(open(bpath, "rb").read())
+            if self.container is not None:
+                song_bytes = self._v137_read(self._song_rel(slot.level_assets_file))
+            else:
+                song_bytes = open(bpath, "rb").read()
+            ub = UnityFsBundle.from_bytes(song_bytes)
             cab_n = next(n for n in ub.nodes if not n.name.endswith((".resource", ".resS")))
             res_n = next(n for n in ub.nodes if n.name.endswith(".resource"))
             fsb_meta = verify_fsb5_header(res_n.data)
@@ -1968,14 +2052,14 @@ class PS5BeatSaberManager:
         base_remote = remote_app_dir.rstrip("/")
 
         # Ordered upload queue: song bundles -> pack bundles -> optional sharedassets -> catalog.json -> ampr_emu.index LAST
-        uploads: List[Tuple[str, str]] = []
+        uploads: List[Tuple[str, str]] = []  # (v137 rel path, remote path)
         packs_set = set()
         any_covers = False
         for lid, info in sorted(installed.items()):
             sfn = info.get("song_bundle_file") or lid.lower()
             uploads.append(
                 (
-                    os.path.join(self.levels_bundle_dir, sfn),
+                    self._song_rel(sfn),
                     f"{base_remote}/Media/StreamingAssets/BeatmapLevelsData/{sfn}",
                 )
             )
@@ -1987,7 +2071,7 @@ class PS5BeatSaberManager:
         for pfn in sorted(packs_set):
             uploads.append(
                 (
-                    os.path.join(self.aa_ps5_dir, pfn),
+                    self._pack_rel(pfn),
                     f"{base_remote}/Media/StreamingAssets/aa/PS5/{pfn}",
                 )
             )
@@ -1996,32 +2080,32 @@ class PS5BeatSaberManager:
         if any_covers and sa_fn:
             uploads.append(
                 (
-                    os.path.join(self.aa_ps5_dir, sa_fn),
+                    self._pack_rel(sa_fn),
                     f"{base_remote}/Media/StreamingAssets/aa/PS5/{sa_fn}",
                 )
             )
 
-        if os.path.isfile(self.catalog_json_path):
+        if self._v137_exists(self.CATALOG_REL):
             uploads.append(
                 (
-                    self.catalog_json_path,
+                    self.CATALOG_REL,
                     f"{base_remote}/Media/StreamingAssets/aa/catalog.json",
                 )
             )
 
-        if os.path.isfile(self.ampr_index_path):
-            uploads.append((self.ampr_index_path, f"{base_remote}/ampr_emu.index"))
+        if self._v137_exists(self.AMPR_REL):
+            uploads.append((self.AMPR_REL, f"{base_remote}/ampr_emu.index"))
 
         log(f"Connecting to PS5 FTP at {ps5_ip}:{ps5_port} ({len(uploads)} files, index last)...")
         with ftplib.FTP() as ftp:
             ftp.connect(ps5_ip, ps5_port, timeout=20)
             ftp.login("anonymous", "")
 
-            for idx, (local_p, remote_p) in enumerate(uploads, start=1):
-                local_bytes = open(local_p, "rb").read()
+            for idx, (local_rel, remote_p) in enumerate(uploads, start=1):
+                local_bytes = self._v137_read(local_rel)
                 local_sha1 = hashlib.sha1(local_bytes).hexdigest()
                 log(
-                    f"[{idx}/{len(uploads)}] Uploading {os.path.basename(local_p)} "
+                    f"[{idx}/{len(uploads)}] Uploading {os.path.basename(local_rel)} "
                     f"({len(local_bytes) / (1024 * 1024):.2f} MB)..."
                 )
                 ftp.storbinary(f"STOR {remote_p}", io.BytesIO(local_bytes), blocksize=262144)

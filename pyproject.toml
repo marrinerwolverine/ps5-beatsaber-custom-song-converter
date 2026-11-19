@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "ps5-beatsaber-custom-song-converter"
-version = "1.2.0"
+version = "1.3.0"
 description = "Convert BeatSaver community custom songs into native PS5 / PSVR2 Beat Saber format."
 readme = "README.md"
 license = { text = "MIT" }

@@ -15,6 +15,7 @@ from .auto_mapper import (
     generate_track_from_audio_file,
 )
 from .beatsaver_client import download_beatsaver_zip, search_beatsaver
+from .exfat_container import find_exfat_image
 from .game_manager import COLOR_THEME_PRESETS, PS5BeatSaberManager, find_ps5_game_root
 from .stage_modder import STAGE_MESH_TARGETS
 
@@ -29,6 +30,14 @@ def _auto_default_game_dir() -> Optional[str]:
         os.path.join(workspace_parent, "Beat Saber for the PS5"),
         workspace_parent,
     ]
+    # 1.37 is the permanently supported target: prefer backport .exfat images first.
+    for base in candidates:
+        if os.path.isdir(base):
+            for entry in sorted(os.listdir(base)):
+                if entry.lower().endswith(".exfat"):
+                    found = find_exfat_image(os.path.join(base, entry))
+                    if found:
+                        return found
     for c in candidates:
         if os.path.exists(c):
             try:

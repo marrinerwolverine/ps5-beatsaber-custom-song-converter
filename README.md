@@ -1,21 +1,24 @@
-# PS5 Beat Saber (PSVR2) — Custom Song & Stage Studio (`1.12` + `1.37`)
+# Beat Saber Deluxe — PS5 (PSVR2) Custom Song Studio (`1.37`)
 
-Converts community custom songs from **BeatSaver** (`.zip` packages, `.bplist` playlists, map folders, or direct BeatSaver search/IDs)—or **auto-generates playable tracks from any `.mp3`/`.wav`/`.ogg`/`.flac` music file**—directly into native **PS5 / PSVR2 Beat Saber** (`PPSA15035` / `PPSA14734`) game assets for a jailbroken PS5.
+Converts community custom songs from **BeatSaver** (`.zip` packages, `.bplist` playlists, map folders, or direct BeatSaver search/IDs)—or **auto-generates playable tracks from any `.mp3`/`.wav`/`.ogg`/`.flac` music file**—directly into native **PS5 / PSVR2 Beat Saber** (`PPSA15035`) game assets for a jailbroken PS5.
 
-Supports **both** PS5 Beat Saber generations automatically out of the box:
-- **Beat Saber `1.12` (`contentVersion 01.012.000`, Unity `2021.3.16f1`):** Monolithic `Media/sharedassets*.assets` + `PCM16 FSB5` tail-append engine (all 234 OST + DLC slots).
-- **Beat Saber `1.37` (`contentVersion 01.037.000`, Unity `2022.3.33f1` Addressables):** Hardware-proven per-song `BeatmapLevelsData` `UnityFS` (`0x243` LZ4HC) engine with `0x6D39BF3E` Vorbis `FSB5` audio + 0-offset sync verification, tempo-flattened `v4.0.0` beatmap/lightshow/`audio.gz` JSON, byte-exact level-pack `BeatmapLevelSO` + 10s preview splicing, same-length `aa/catalog.json` `m_Crc: 0` updates, backport `ampr_emu.index` file-size updates, and optional PS5 `Standard 4KB` BC7 `SongArtworks` cover art pasting (208 Standard-only OST + DLC slots across 35 packs).
+**The game version is permanently `1.37` (`01.037.000`)** and the tool now operates directly on the backport **`.exfat` game image** (`PPSA15035 Beat Saber (01.037.000).exfat`) as well as extracted folder dumps:
+
+- **Backport `.exfat` Container Support:** Open the game image directly — the tool reads/writes files inside the AMPRIDX3 container (master index + size-derived 64KB-aligned payload), keeps the index and physical layout perfectly consistent, and preserves pristine backups so any slot restores byte-identically. No more "tool said installed but the game kept the old song" — everything is written into the actual image the PS5 loads.
+- **`1.37` Addressables Engine:** Per-song `BeatmapLevelsData` `UnityFS` (`0x243` LZ4HC) bundles with `0x6D39BF3E` Vorbis `FSB5` audio, tempo-flattened `v4.0.0` beatmap/lightshow/`audio.gz` `TextAsset`s (sparse JSON matching the real game files), byte-exact level-pack `CAB` splicing, same-length `aa/catalog.json` `m_Crc: 0` updates, optional PS5 `Standard 4KB` BC7 cover-art pasting, and a SHA-1-verified FTP push (`ampr_emu.index` last).
+- **Legacy `1.12` folder support is retained** (`Media/sharedassets48.assets`, 234 OST + DLC slots).
 
 ---
 
-## Key Features
-- **Hardware-Verified Dual Backend (`1.12` & `1.37`):** Automatically detects `Media/sharedassets48.assets` (`1.12`) vs `Media/StreamingAssets/BeatmapLevelsData/` + `aa/catalog.json` (`1.37`) and `ampr_emu.index`.
-- **True In-Game Song Titles, Artists, Lengths, Previews & Stages:** Updates `BeatmapLevelSO` natively on both `1.12` and `1.37`—no runtime `.prx` plugin required.
-- **Full OST + DLC Pack Support & Batch Pack Importer:** Unlocks all OST, Extras, and DLC Music Packs in the slot browser, plus 1-click **`📦 Batch Fill Pack...`** from BeatSaver `.bplist` playlists or folders of `.zip` / music files.
-- **Offline Audio-to-Beatmap Studio (`Ctrl+V` Any Music File):** Copy & paste (`Ctrl+V`) or select any `.mp3`, `.wav`, `.ogg`, `.flac`, or `.egg` file to detect BPM & beat phase via multi-band spectral flux and procedurally generate all 5 difficulties (`Easy` → `Expert+`) with wrist-parity flow and a synced stage lightshow.
-- **Universal BeatSaver Schema Support (`V2`, `V3`, and `V4`):** Automatically fills missing lower difficulties (`Easy`, `Normal`, `Hard`, `Expert`) for friends & family.
-- **Stages, Neon Colors & 3D Models:** Per-song Stage Arena overrides on both `1.12` & `1.37`, `ColorSchemeSO` neon saber/light themes & Wavefront `.obj` 3D stage geometry injection on `1.12`, and optional PS5 `Standard 4KB` BC7 cover-art atlas pasting on `1.37`.
-- **Pristine Backups, Surgical Restore & Verified FTP Push:** Keeps pristine backups outside `PPSA*-app`, restores single slots or full factory state cleanly, and supports direct PS5 FTP push (`1.12` delta tail push; `1.37` whole-file SHA-1 read-back verified push with `ampr_emu.index` last).
+## What's New in `v1.3.0`
+
+Fixes reported by real hardware users (thanks R_Jay!):
+
+1. **Songs now really save on `1.37`.** The whole `1.37` pipeline operates directly inside the backport `.exfat` image (or folder dump) through a consistent storage layer, so every install lands in the exact files the PS5 loads.
+2. **No more crash on full-length songs.** The audio step used to die with a native stack overflow (libsndfile's recursive OGG write) on real-music songs of roughly 20-30 seconds or longer. OGG encoding now streams in bounded chunks — a 90-second dense mix encodes cleanly (regression-tested).
+3. **Auto-made maps no longer arrive early.** The auto-mapper now anchors notes to the audio's **absolute beat phase** (notes land exactly on the detected beats) and emits `_songTimeOffset: 0`; community maps' `_songTimeOffset` is honored natively via the `v4` `bpmData` sample anchor.
+4. **New "Joyful / Chilled" auto-map style** — gentler note density, fewer bombs/walls, comfortable swings. The three existing styles are untouched.
+5. **Damage-tolerant catalog:** a corrupt DLC bundle inside a backport image (e.g. a bad `bts_pack`) is skipped with a warning instead of breaking the whole load.
 
 ---
 
@@ -26,8 +29,9 @@ Supports **both** PS5 Beat Saber generations automatically out of the box:
    Launch PS5 Beat Saber Converter.bat
    ```
    *(First launch automatically creates `.venv` and installs dependencies.)*
-3. Pick your decrypted `PPSA15035-app` (`1.12` or `1.37`) folder in the top bar.
+3. Pick your game in the top bar — your **`.exfat` backport image** is auto-discovered, or browse to the folder that contains it (an extracted folder dump also works).
 4. Search BeatSaver, open a `.zip`, or paste (`Ctrl+V`) any music file to auto-map a track, choose a target slot, and click **`⚡ CONVERT & INSTALL INTO PS5 BEAT SABER`**.
+5. Flash the updated `.exfat` image to your USB drive (or push the changed files over **FTP** from the Library page) and play.
 
 ---
 
@@ -35,24 +39,24 @@ Supports **both** PS5 Beat Saber generations automatically out of the box:
 ```bash
 pip install -r requirements.txt
 
-# Check detected game version (1.12 vs 1.37) and installed custom songs
-python app.py --game-dir "/path/to/PPSA15035-app" status
+# Check detected game version and installed custom songs (works on .exfat images)
+python app.py --game-dir "D:\Dumps\PPSA15035 Beat Saber (01.037.000).exfat" status
 
 # List available OST + DLC slots
-python app.py --game-dir "/path/to/PPSA15035-app" list-slots
+python app.py --game-dir "D:\Dumps\PPSA15035 Beat Saber (01.037.000).exfat" list-slots
 
-# Download & install a BeatSaver map into a slot (add --cover on 1.37 for experimental BC7 cover art)
-python app.py --game-dir "/path/to/PPSA15035-app" install --beatsaver 30560 --slot SpookyBeat
+# Download & install a BeatSaver map into a slot (add --cover for BC7 cover art)
+python app.py --game-dir "D:\Dumps\PPSA15035 Beat Saber (01.037.000).exfat" install --beatsaver 30560 --slot SpookyBeat
 
 # Auto-generate a 5-difficulty track from any MP3/WAV/OGG file and install it
-python app.py --game-dir "/path/to/PPSA15035-app" make-track --audio "/path/to/song.mp3" --slot SpookyBeat
+python app.py --game-dir "D:\Dumps\PPSA15035 Beat Saber (01.037.000).exfat" make-track --audio "C:\Music\song.mp3" --slot SpookyBeat
 
 # Batch-fill an entire pack from a BeatSaver .bplist playlist or folder
-python app.py --game-dir "/path/to/PPSA15035-app" install-pack-batch --pack Queen --source "/path/to/playlist.bplist"
+python app.py --game-dir "D:\Dumps\PPSA15035 Beat Saber (01.037.000).exfat" install-pack-batch --pack Queen --source "C:\Playlists\queen.bplist"
 
 # Restore a single slot or reset everything to 100% stock
-python app.py --game-dir "/path/to/PPSA15035-app" restore --slot SpookyBeat
-python app.py --game-dir "/path/to/PPSA15035-app" restore-all
+python app.py --game-dir "D:\Dumps\PPSA15035 Beat Saber (01.037.000).exfat" restore --slot SpookyBeat
+python app.py --game-dir "D:\Dumps\PPSA15035 Beat Saber (01.037.000).exfat" restore-all
 ```
 
 ---
@@ -62,10 +66,9 @@ python app.py --game-dir "/path/to/PPSA15035-app" restore-all
 pip install -r requirements.txt pytest
 pytest -v
 ```
-To run the full hardware-layout integration tests against local `1.12` and/or `1.37` dumps:
+To also run the hardware-layout tests against a real backport image (read-only + an isolated mini-container sandbox):
 ```powershell
-$env:PS5_BEATSABER_DUMP = "C:\path\to\PPSA15035-app 1.12"
-$env:PS5_BEATSABER_DUMP_137 = "C:\path\to\PPSA15035-app 1.37\PPSA15035-app"
+$env:PS5_BEATSABER_EXFAT = "C:\path\to\PPSA15035 Beat Saber (01.037.000).exfat"
 pytest -v
 ```
 

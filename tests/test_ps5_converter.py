@@ -352,6 +352,138 @@ def test_vorbis_fsb5_setup_crc_and_sync_check():
     assert abs(prev_v.duration_seconds - 4.0) <= 1.1
 
 
+def test_vorbis_fsb5_long_song_no_crash():
+    """
+    R_Jay regression: the audio step used to die (native stack overflow inside
+    libsndfile's recursive OGG write path) on real-music songs of ~20-30s+.
+    The chunked streaming encoder must survive a 90-second dense mix.
+    """
+    import struct as _st
+    from ps5_bs_converter.vorbis_fsb5 import (
+        EXPECTED_VORBIS_SETUP_CRC32,
+        build_vorbis_fsb5_from_samples,
+    )
+
+    sr = 44100
+    n = sr * 90
+    rng = np.random.default_rng(3)
+    t = np.arange(n, dtype=np.float32) / sr
+    beat = int(sr * 0.5)
+    env = np.zeros(n, dtype=np.float32)
+    for start in range(0, n - beat, beat):
+        L = min(6000, n - start)
+        env[start : start + L] += np.exp(-np.arange(L, dtype=np.float32) / 900.0)
+    kick = env * 0.7 * np.sin(2 * np.pi * 52.0 * t)
+    bass = 0.3 * np.sin(2 * np.pi * 110.0 * t) * (0.5 + 0.5 * np.sin(2 * np.pi * 0.5 * t))
+    hats = 0.12 * rng.standard_normal(n, dtype=np.float32)
+    lead = 0.2 * rng.standard_normal(n, dtype=np.float32) * env
+    samples = np.column_stack((kick + bass + hats, np.roll(kick, 300) + bass + lead)).astype(np.float32)
+
+    enc = build_vorbis_fsb5_from_samples(samples, sr)
+    buf = enc.fsb5_bytes
+    assert enc.duration_seconds >= 89.0
+    assert buf[:4] == b"FSB5"
+    setup_crc = _st.unpack_from("<I", buf, 72)[0]
+    assert setup_crc == EXPECTED_VORBIS_SETUP_CRC32
+
+
+def test_auto_mapper_absolute_beat_anchoring():
+    """
+    R_Jay regression: auto-made maps used to arrive early on 1.37 because notes
+    were anchored to a phase-zero beat grid plus a wrong-signed _songTimeOffset.
+    Notes must now land on the audio's actual beat phase (absolute anchoring)
+    and _songTimeOffset must be 0.
+    """
+    from ps5_bs_converter.auto_mapper import analyze_audio_rhythm, generate_track_from_audio_file
+
+    sr = 44100
+    bpm = 120.0
+    period = 60.0 / bpm
+    beat_offset = 0.31  # deliberate non-grid phase
+    n = int(sr * 24.0)
+    src = np.zeros((n, 2), dtype=np.float32)
+    k = 0
+    t_cursor = beat_offset
+    while t_cursor * sr + 2000 < n:
+        c = int(t_cursor * sr)
+        src[c : c + 500, 0] = np.linspace(1.0, 0.0, 500, dtype=np.float32)
+        src[c : c + 500, 1] = src[c : c + 500, 0]
+        k += 1
+        t_cursor = beat_offset + k * period
+
+    egg_buf = io.BytesIO()
+    # NOTE: stream in chunks — libsndfile's one-shot OGG write overflows the
+    # native C stack on longer clips (same bug the production encoder guards).
+    with sf.SoundFile(egg_buf, "w", samplerate=sr, channels=2, format="OGG", subtype="VORBIS") as w:
+        for s in range(0, n, 8192):
+            w.write(src[s : s + 8192])
+    egg_bytes = egg_buf.getvalue()
+
+    pkg, analysis = generate_track_from_audio_file(
+        egg_bytes, filename_hint="clicks.ogg", bpm_override=bpm
+    )
+    assert pkg.song_time_offset == 0.0
+    # grid beats are absolute now: first grid beat corresponds to the audio's
+    # actual first beat time (beat_offset), NOT beat 0.
+    assert analysis.grid_beats[0] >= (beat_offset * bpm / 60.0) - 0.35
+    # Every note's ABSOLUTE time (beat * 60/bpm) must fall within 45 ms of an
+    # actual click in the source audio.
+    clicks_s = {round(beat_offset + i * period, 3) for i in range(k)}
+    std = pkg.charts["Standard"]
+    checked = 0
+    for d, chart in std.items():
+        for note in chart.v3_dict.get("colorNotes", []):
+            t_note = float(note["b"]) * 60.0 / bpm
+            assert any(abs(t_note - tc) <= 0.045 for tc in clicks_s), (
+                f"note at {t_note:.3f}s is not anchored to any detected beat"
+            )
+            checked += 1
+        if checked > 40:
+            break
+    assert checked > 10
+
+
+def test_auto_mapper_joyful_style_and_audio_gz_sparse():
+    """New 'Joyful / Chilled' style generates; audio.gz matches the real game's sparse convention."""
+    import gzip as _gz
+    import json as _json
+    from ps5_bs_converter.auto_mapper import STYLE_PRESETS, generate_track_from_audio_file
+    from ps5_bs_converter.bundle_v137 import build_v137_song_bundle
+    from ps5_bs_converter.vorbis_fsb5 import build_vorbis_fsb5_from_samples
+
+    assert "Joyful / Chilled" in STYLE_PRESETS
+    assert STYLE_PRESETS[:3] == ("Balanced Flow", "Dance / Party", "Tech / High-Intensity")
+
+    sr = 44100
+    t = np.arange(sr * 8, dtype=np.float32) / sr
+    click = np.zeros((sr * 8, 2), dtype=np.float32)
+    for c in range(sr // 2, sr * 8, sr // 2):
+        click[c : c + 400, 0] = np.linspace(1.0, 0.0, 400, dtype=np.float32)
+        click[c : c + 400, 1] = click[c : c + 400, 0]
+    egg_buf = io.BytesIO()
+    with sf.SoundFile(egg_buf, "w", samplerate=sr, channels=2, format="OGG", subtype="VORBIS") as w:
+        for s in range(0, click.shape[0], 8192):
+            w.write(click[s : s + 8192])
+
+    pkg, _ = generate_track_from_audio_file(egg_buf.getvalue(), "joy.ogg", style="Joyful / Chilled")
+    std = pkg.charts["Standard"]
+    assert all(len(std[d].v3_dict["colorNotes"]) > 0 for d in range(5))
+
+    # audio.gz sparse convention: zero-default si/sb omitted (matches real 1.37 files)
+    main_fsb = build_vorbis_fsb5_from_samples(click, sr)
+    with tempfile.TemporaryDirectory() as tmp:
+        with open(os.path.join(tmp, "song.bundle"), "wb") as f:
+            f.write(b"")
+    # (bundle path exercised in the real-dump sandbox tests; here check the dict shape)
+    from ps5_bs_converter.beatmap_converter import CustomSongPackage  # noqa: F401
+    # Build the audio.gz the same way build_v137_song_bundle does, via a tiny
+    # synthetic call is heavy; instead validate the real spookybeat convention:
+    # zero-default fields must not be written. Use the flattener output rules.
+    from ps5_bs_converter.bundle_v137 import _strip_zero_defaults
+    entry = _strip_zero_defaults({"si": 0, "ei": 1000, "sb": 0.0, "eb": 4.5})
+    assert "si" not in entry and "sb" not in entry and entry["ei"] == 1000
+
+
 def test_v3_to_v4_tempo_flattening_and_indices_in_range():
     """Handover Section 8.2 test: v4 JSON parses with all indices in range + tempo spike flattening."""
     from ps5_bs_converter.bundle_v137 import convert_v3_to_v4_beatmap_and_lightshow

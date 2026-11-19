@@ -301,14 +301,24 @@ def _intern_v4_row(rows: List[Dict[str, Any]], cache: Dict[str, int], row: Dict[
 def convert_v3_to_v4_beatmap_and_lightshow(
     v3_dict: Dict[str, Any],
     base_bpm: float,
+    beat_shift: float = 0.0,
 ) -> Tuple[Dict[str, Any], Dict[str, Any], Dict[str, int]]:
     """
     Convert a V3.3.0 chart dict into Beat Saber 1.37's V4.0.0 beatmap JSON + V4.0.0 lightshow JSON,
     with tempo flattened to `base_bpm` and all property rows deduplicated cleanly.
 
+    `beat_shift` optionally slides every flattened beat later (used to honor
+    negative `_songTimeOffset` values from community maps, which cannot be
+    expressed as a negative sample anchor).
+
     Returns (v4_beatmap_dict, v4_lightshow_dict, counts_dict).
     """
     flatten = _build_tempo_flattener(v3_dict.get("bpmEvents") or [], base_bpm)
+    if beat_shift:
+        _base_flatten = flatten
+
+        def flatten(b):  # noqa: F811
+            return round(_base_flatten(b) + beat_shift, 6)
 
     cn_data: List[Dict[str, Any]] = []
     cn_cache: Dict[str, int] = {}
@@ -587,10 +597,16 @@ def build_v137_song_bundle(
     main_fsb: EncodedVorbisFsb5,
     std_5_charts: Dict[int, ParsedDifficultyChart],
     base_bpm: float,
+    song_time_offset: float = 0.0,
 ) -> Tuple[bytes, Dict[int, Dict[str, Any]]]:
     """
     Rewrite a 1.37 Standard-only song bundle with Vorbis FSB5 audio, tempo-flattened
     v4.0.0 beatmaps, v4.0.0 lightshows, and <Song>.audio.gz.
+
+    `song_time_offset` (community maps' `_songTimeOffset`, seconds) is honored:
+    positive values anchor beat 0 at sample si = offset*44100 via sparse
+    `bpmData`/`lufsData` entries (matching the real game files' convention of
+    omitting zero-default fields); negative values shift all notes later.
 
     Returns (new_song_bundle_bytes, per_diff_stats_for_pack_patch).
     """
@@ -627,6 +643,17 @@ def build_v137_song_bundle(
         raise ValueError(f"1.37 slot guard: expected difficulties 0..4, got {diffs_present}")
 
     # Convert all 5 Standard difficulties to v4.0.0 beatmaps & lightshows
+    sto = float(song_time_offset or 0.0)
+    if sto > 0.0:
+        anchor_sample = max(0, int(round(sto * 44100)))
+        beat_shift = 0.0
+    elif sto < 0.0:
+        anchor_sample = 0
+        beat_shift = (-sto) * (base_bpm / 60.0)
+    else:
+        anchor_sample = 0
+        beat_shift = 0.0
+
     v4_beatmaps: Dict[int, Dict[str, Any]] = {}
     v4_lightshows: Dict[int, Dict[str, Any]] = {}
     diff_stats: Dict[int, Dict[str, Any]] = {}
@@ -634,7 +661,9 @@ def build_v137_song_bundle(
 
     for d in range(5):
         chart = std_5_charts[d]
-        v4_bm, v4_ls, counts = convert_v3_to_v4_beatmap_and_lightshow(chart.v3_dict, base_bpm)
+        v4_bm, v4_ls, counts = convert_v3_to_v4_beatmap_and_lightshow(
+            chart.v3_dict, base_bpm, beat_shift=beat_shift
+        )
         v4_beatmaps[d] = v4_bm
         v4_lightshows[d] = v4_ls
         diff_stats[d] = {
@@ -660,26 +689,22 @@ def build_v137_song_bundle(
     audio_clip_pid = int(level_data_tt["_audioClip"]["m_PathID"])
 
     total_beats = max(main_fsb.duration_seconds * (base_bpm / 60.0), max_flat_beat + 2.0)
+    # Sparse audio.gz matching the real 1.37 game files: zero-default fields
+    # (`si`/`sb`) are omitted entirely; a nonzero `_songTimeOffset` anchors
+    # beat 0 at sample `anchor_sample` via `si`.
+    if anchor_sample:
+        bpm_entry = {"si": anchor_sample, "ei": main_fsb.total_frames, "eb": round(total_beats, 4)}
+        lufs_entry = {"si": anchor_sample, "ei": main_fsb.total_frames, "l": round(main_fsb.loudness_lufs, 2)}
+    else:
+        bpm_entry = {"ei": main_fsb.total_frames, "eb": round(total_beats, 4)}
+        lufs_entry = {"ei": main_fsb.total_frames, "l": round(main_fsb.loudness_lufs, 2)}
     audio_gz_dict = {
         "version": "4.0.0",
         "songChecksum": main_fsb.sha1_base64,
         "songSampleCount": main_fsb.total_frames,
         "songFrequency": 44100,
-        "bpmData": [
-            {
-                "si": 0,
-                "ei": main_fsb.total_frames,
-                "sb": 0.0,
-                "eb": round(total_beats, 4),
-            }
-        ],
-        "lufsData": [
-            {
-                "si": 0,
-                "ei": main_fsb.total_frames,
-                "l": round(main_fsb.loudness_lufs, 2),
-            }
-        ],
+        "bpmData": [bpm_entry],
+        "lufsData": [lufs_entry],
     }
 
     replacements: Dict[int, bytes] = {}

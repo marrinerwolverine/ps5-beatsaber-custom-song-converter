@@ -27,6 +27,7 @@ from .audio_fsb5 import _resample_stereo, decode_audio_bytes, estimate_loudness_
 
 EXPECTED_VORBIS_SETUP_CRC32 = 0x6D39BF3E
 TARGET_SR = 44100
+_OGG_WRITE_CHUNK_FRAMES = 8192  # streaming chunk size (native stack-overflow guard)
 
 
 @dataclass
@@ -172,8 +173,23 @@ def build_vorbis_fsb5_from_samples(samples: np.ndarray, sample_rate: int) -> Enc
     loudness = estimate_loudness_lufs(samples)
 
     # Encode Ogg Vorbis at compression_level=0.1 -> produces setup CRC 0x6D39BF3E
+    # IMPORTANT: write in small chunks through the streaming interface.
+    # libsndfile's one-shot sf.write() on OGG/VORBIS recurses per compressed
+    # byte volume and overflows the native C stack on real music (crashes on
+    # songs of roughly 20-30 seconds or longer). Chunked writes keep the
+    # recursion depth bounded regardless of song length.
     ogg_buf = io.BytesIO()
-    sf.write(ogg_buf, samples, TARGET_SR, format="OGG", subtype="VORBIS", compression_level=0.1)
+    with sf.SoundFile(
+        ogg_buf,
+        "w",
+        samplerate=TARGET_SR,
+        channels=2,
+        format="OGG",
+        subtype="VORBIS",
+        compression_level=0.1,
+    ) as ogg_writer:
+        for chunk_start in range(0, total_frames, _OGG_WRITE_CHUNK_FRAMES):
+            ogg_writer.write(samples[chunk_start : chunk_start + _OGG_WRITE_CHUNK_FRAMES])
     ogg_bytes = ogg_buf.getvalue()
 
     # Sync check: decode back and verify exact frame count & 0-sample offset

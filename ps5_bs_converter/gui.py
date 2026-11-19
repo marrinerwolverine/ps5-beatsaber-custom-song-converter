@@ -30,6 +30,7 @@ from .beatsaver_client import (
     search_beatsaver,
 )
 from .cli import _auto_default_game_dir
+from .exfat_container import find_exfat_image
 from .game_manager import (
     COLOR_THEME_PRESETS,
     PS5BeatSaberManager,
@@ -72,6 +73,21 @@ def _discover_nearby_dumps() -> List[str]:
     bs_folder = os.path.join(ws_parent, "Beat Saber for the PS5")
     found: List[str] = []
     seen_norm = set()
+
+    # Backport .exfat game images (1.37 permanent target format)
+    for base in (bs_folder, ws_parent):
+        if not os.path.isdir(base):
+            continue
+        for entry in sorted(os.listdir(base)):
+            if entry.lower().endswith((".exfat", ".img")) and not entry.startswith("_"):
+                img = find_exfat_image(os.path.join(base, entry))
+                if img:
+                    nk = os.path.normcase(os.path.abspath(img))
+                    if nk not in seen_norm:
+                        seen_norm.add(nk)
+                        found.append(img)
+
+    # Extracted folder dumps
     if os.path.isdir(bs_folder):
         for entry in sorted(os.listdir(bs_folder)):
             if entry.startswith(("_", "[")):
@@ -1160,25 +1176,35 @@ class ConverterApp:
     # ==========================================================================
 
     def _on_browse_game_dir(self) -> None:
-        chosen = filedialog.askdirectory(title="Select PS5 Beat Saber Folder (1.12 or 1.37)")
+        chosen = filedialog.askdirectory(title="Select PS5 Beat Saber Folder (or folder containing a .exfat game image)")
         if chosen:
-            self.game_dir_var.set(chosen)
-            self._load_game_folder(chosen)
+            # If the picked folder holds a backport .exfat image, prefer it (1.37 permanent format).
+            img = find_exfat_image(chosen)
+            target = img or chosen
+            self.game_dir_var.set(target)
+            self._load_game_folder(target)
 
     def _load_game_folder(self, folder: str) -> None:
         if not folder.strip():
             return
+        old_manager = self.manager
         try:
             self.manager = PS5BeatSaberManager(folder)
         except Exception as exc:
+            self.manager = old_manager
             self.pill_engine_var.set("ENGINE: INVALID")
-            messagebox.showerror("Could Not Load PS5 Dump", str(exc))
+            messagebox.showerror("Could Not Load PS5 Game", str(exc))
             return
+        if old_manager is not None and old_manager is not self.manager:
+            try:
+                old_manager.close()
+            except Exception:
+                pass
 
         self.game_dir_var.set(self.manager.app_root)
         self._refresh_all_views()
         mode_desc = (
-            "1.37 Addressables + Vorbis FSB5 + AMPR Index"
+            "1.37 Addressables + Vorbis FSB5 + exFAT Container"
             if self.manager.engine_mode == "bundle_v137"
             else "1.12 SharedAssets + PCM16 FSB5"
         )
@@ -1186,6 +1212,8 @@ class ConverterApp:
             f"Loaded {self.manager.title_id} v{self.manager.content_version} [{mode_desc}] — "
             f"{len(self.manager.slots)} playable slots ready."
         )
+        for warn in getattr(self.manager, "catalog_warnings", []) or []:
+            self._append_log_ui(f"⚠ {warn}")
 
     def _refresh_all_views(self) -> None:
         if not self.manager:
